@@ -1,28 +1,39 @@
-from unittest.mock import Mock
-from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
-import requests
 
 from harbor.llms.base import ContextLengthExceededError
 from responses_api_agents.harbor_agent.custom_agents.llms.nemo_gym_llm import NemoGymLLM
 
 
-@pytest.mark.asyncio
-async def test_nemo_gym_llm_extracts_openai_shape(monkeypatch):
-    llm = NemoGymLLM(
-        model_name="test-model",
-        api_base="http://localhost:8000/v1",
-        collect_rollout_details=True,
-    )
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    mock_response = Mock()
-    mock_response.raise_for_status.return_value = None
-    mock_response.json.return_value = {
+def _make_llm(**kwargs) -> NemoGymLLM:
+    defaults = dict(model_name="test-model", api_base="http://localhost:8000/v1")
+    defaults.update(kwargs)
+    return NemoGymLLM(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_nemo_gym_llm_extracts_openai_shape():
+    """Standard vLLM-shaped response: prompt_token_ids at top-level, generation_token_ids in message."""
+    llm = _make_llm(collect_rollout_details=True)
+
+    mock_json = {
         "choices": [
             {
-                "message": {"content": "hello"},
-                "provider_specific_fields": {"token_ids": [7, 8]},
+                "message": {
+                    "content": "hello",
+                    "generation_token_ids": [7, 8],
+                },
                 "logprobs": {"content": [{"logprob": -0.1}, {"logprob": -0.2}]},
                 "finish_reason": "stop",
             }
@@ -34,9 +45,10 @@ async def test_nemo_gym_llm_extracts_openai_shape(monkeypatch):
             "prompt_tokens_details": {"cached_tokens": 4},
         },
     }
-    monkeypatch.setattr("requests.post", lambda *args, **kwargs: mock_response)
 
-    response = await llm.call(prompt="hello")
+    with patch.object(llm, "_post_chat_completions", new_callable=AsyncMock, return_value=mock_json):
+        response = await llm.call(prompt="hello")
+
     assert response.content == "hello"
     assert response.prompt_token_ids == [1, 2, 3]
     assert response.completion_token_ids == [7, 8]
@@ -47,16 +59,11 @@ async def test_nemo_gym_llm_extracts_openai_shape(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_nemo_gym_llm_extracts_nemo_proxy_shape(monkeypatch):
-    llm = NemoGymLLM(
-        model_name="test-model",
-        api_base="http://localhost:8000/v1",
-        collect_rollout_details=True,
-    )
+async def test_nemo_gym_llm_extracts_nemo_proxy_shape():
+    """NeMo proxy shape: token IDs embedded in the message dict."""
+    llm = _make_llm(collect_rollout_details=True)
 
-    mock_response = Mock()
-    mock_response.raise_for_status.return_value = None
-    mock_response.json.return_value = {
+    mock_json = {
         "choices": [
             {
                 "message": {
@@ -69,9 +76,10 @@ async def test_nemo_gym_llm_extracts_nemo_proxy_shape(monkeypatch):
             }
         ],
     }
-    monkeypatch.setattr("requests.post", lambda *args, **kwargs: mock_response)
 
-    response = await llm.call(prompt="hello")
+    with patch.object(llm, "_post_chat_completions", new_callable=AsyncMock, return_value=mock_json):
+        response = await llm.call(prompt="hello")
+
     assert response.content == "proxy output"
     assert response.prompt_token_ids == [11, 12]
     assert response.completion_token_ids == [13, 14]
@@ -79,35 +87,30 @@ async def test_nemo_gym_llm_extracts_nemo_proxy_shape(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_nemo_gym_llm_context_error_translation(monkeypatch):
-    llm = NemoGymLLM(
-        model_name="test-model",
-        api_base="http://localhost:8000/v1",
+async def test_nemo_gym_llm_context_error_translation():
+    """HTTP 400 with context-length message raises ContextLengthExceededError."""
+    llm = _make_llm()
+
+    error_response = httpx.Response(
+        status_code=400,
+        text="maximum context length exceeded",
+        request=httpx.Request("POST", "http://localhost:8000/v1/chat/completions"),
     )
 
-    mock_response = Mock()
-    mock_response.status_code = 400
-    mock_response.text = "maximum context length exceeded"
-    http_error = requests.HTTPError("400 bad request")
-    http_error.response = mock_response
-    mock_response.raise_for_status.side_effect = http_error
+    async def _raise_context_error(payload, timeout_sec=None):
+        llm._raise_for_status(error_response)
 
-    monkeypatch.setattr("requests.post", lambda *args, **kwargs: mock_response)
-    with pytest.raises(ContextLengthExceededError):
-        await llm.call(prompt="hello")
+    with patch.object(llm, "_post_chat_completions", side_effect=_raise_context_error):
+        with pytest.raises(ContextLengthExceededError):
+            await llm.call(prompt="hello")
 
 
 @pytest.mark.asyncio
-async def test_nemo_gym_llm_no_rollout_details_for_openai_model(monkeypatch):
-    llm = NemoGymLLM(
-        model_name="test-model",
-        api_base="http://localhost:8000/v1",
-        collect_rollout_details=True,
-    )
+async def test_nemo_gym_llm_no_rollout_details_for_openai_model():
+    """When response has no token IDs / logprobs, those fields are None."""
+    llm = _make_llm(collect_rollout_details=True)
 
-    mock_response = Mock()
-    mock_response.raise_for_status.return_value = None
-    mock_response.json.return_value = {
+    mock_json = {
         "choices": [
             {
                 "message": {"content": "plain output"},
@@ -115,45 +118,36 @@ async def test_nemo_gym_llm_no_rollout_details_for_openai_model(monkeypatch):
             }
         ],
     }
-    monkeypatch.setattr("requests.post", lambda *args, **kwargs: mock_response)
 
-    response = await llm.call(prompt="hello")
+    with patch.object(llm, "_post_chat_completions", new_callable=AsyncMock, return_value=mock_json):
+        response = await llm.call(prompt="hello")
+
     assert response.prompt_token_ids is None
     assert response.completion_token_ids is None
     assert response.logprobs is None
 
 
 @pytest.mark.asyncio
-async def test_nemo_gym_llm_serializes_path_kwargs(monkeypatch):
-    llm = NemoGymLLM(
-        model_name="test-model",
-        api_base="http://localhost:8000/v1",
+async def test_nemo_gym_llm_extra_chat_params_forwarded():
+    """Extra chat params from responses_create_params are included in the payload."""
+    llm = _make_llm(
+        responses_create_params={"temperature": 0.5, "top_p": 0.9, "input": []},
     )
 
-    captured_payload: dict = {}
+    captured_payload = {}
 
-    mock_response = Mock()
-    mock_response.raise_for_status.return_value = None
-    mock_response.json.return_value = {
-        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
-    }
-
-    def _mock_post(*args, **kwargs):
+    async def _capture_post(payload, timeout_sec=None):
         nonlocal captured_payload
-        captured_payload = kwargs["json"]
-        return mock_response
+        captured_payload = payload
+        return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
 
-    monkeypatch.setattr("requests.post", _mock_post)
-
-    response = await llm.call(
-        prompt="hello",
-        metadata={"workspace_path": Path("/tmp/workspace")},
-        files=[Path("/tmp/a.txt"), Path("/tmp/b.txt")],
-    )
+    with patch.object(llm, "_post_chat_completions", side_effect=_capture_post):
+        response = await llm.call(prompt="hello")
 
     assert response.content == "ok"
-    assert captured_payload["metadata"]["workspace_path"] == "/tmp/workspace"
-    assert captured_payload["files"] == ["/tmp/a.txt", "/tmp/b.txt"]
+    # Temperature and top_p should appear in payload via extra_chat_params
+    assert captured_payload.get("temperature") == 0.5
+    assert captured_payload.get("top_p") == 0.9
 
 
 @pytest.mark.parametrize(
@@ -164,8 +158,5 @@ async def test_nemo_gym_llm_serializes_path_kwargs(monkeypatch):
     ],
 )
 def test_nemo_gym_llm_chat_completions_endpoint(api_base, expected_endpoint):
-    llm = NemoGymLLM(
-        model_name="test-model",
-        api_base=api_base,
-    )
+    llm = _make_llm(api_base=api_base)
     assert llm._chat_completions_endpoint() == expected_endpoint

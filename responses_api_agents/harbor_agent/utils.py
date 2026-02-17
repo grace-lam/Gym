@@ -31,6 +31,23 @@ from nemo_gym.openai_utils import (
 @dataclass
 class HarborAgentUtils:
     @staticmethod
+    def _wrap_reasoning_in_think_tags(texts: List[str]) -> str:
+        return "".join(f"<think>{text}</think>" for text in texts if text)
+
+    @staticmethod
+    def _merge_message_and_reasoning(message: str, reasoning_content: Optional[str]) -> str:
+        """Merge reasoning back into the message text with ``<think>`` tags.
+
+        The model's native output format is ``<think>reasoning</think>content``,
+        so we prepend the wrapped reasoning before the message to preserve the
+        original token order (important for training data alignment).
+        """
+        if not reasoning_content:
+            return message
+        wrapped_reasoning = HarborAgentUtils._wrap_reasoning_in_think_tags([reasoning_content])
+        return f"{wrapped_reasoning}{message}"
+
+    @staticmethod
     def get_default_response_object() -> Dict[str, Any]:
         return {
             "id": f"resp_{str(uuid4())}",
@@ -178,26 +195,13 @@ class HarborAgentUtils:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def extract_assistant_texts_from_trajectory(
-        trajectory: Optional[Dict[str, Any]],
-    ) -> List[str]:
-        """Extract assistant message text from ATIF trajectory steps."""
-        if not trajectory:
-            return []
-
-        assistant_texts: List[str] = []
-        for step in trajectory.get("steps", []):
-            if step.get("source") == "agent":
-                assistant_texts.append(step.get("message", "") or "")
-        return assistant_texts
-
-    @staticmethod
     def trajectory_to_responses(trajectory: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Convert ATIF trajectory agent steps to NeMo Gym output items.
 
         Each agent step in the trajectory is converted to:
-        1. An assistant **message** containing the agent's analysis/plan text,
-           preserving the original assistant content.
+        1. An assistant **message** containing the agent's analysis/plan text.
+           Uses ``NeMoGymResponseOutputMessageForTraining`` when the step
+           carries token IDs / logprobs, otherwise ``NeMoGymResponseOutputMessage``.
         2. One **function_call** item per tool call the agent made.
         3. One **function_call_output** item per observation result.
         """
@@ -207,20 +211,46 @@ class HarborAgentUtils:
             if step.get("source") != "agent":
                 continue
 
-            message = NeMoGymResponseOutputMessage(
-                id=f"cht_{uuid4().hex[:12]}",
-                content=[
-                    NeMoGymResponseOutputText(
-                        annotations=[],
-                        text=step.get("message", ""),
-                        type="output_text",
-                        logprobs=None,
-                    ),
-                ],
-                role="assistant",
-                status="completed",
-                type="message",
+            text = HarborAgentUtils._merge_message_and_reasoning(
+                step.get("message", "") or "",
+                step.get("reasoning_content"),
             )
+            content = [
+                NeMoGymResponseOutputText(
+                    annotations=[],
+                    text=text,
+                    type="output_text",
+                    logprobs=None,
+                ),
+            ]
+
+            # Use the training variant when token-level details are available
+            # in the step metrics (written by NemoGymLLM / LiteLLM).
+            metrics = step.get("metrics") or {}
+            prompt_token_ids = metrics.get("prompt_token_ids")
+            completion_token_ids = metrics.get("completion_token_ids")
+            logprobs = metrics.get("logprobs")
+            has_token_details = prompt_token_ids or completion_token_ids or logprobs
+
+            if has_token_details:
+                message = NeMoGymResponseOutputMessageForTraining(
+                    id=f"cht_{uuid4().hex[:12]}",
+                    content=content,
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                    prompt_token_ids=prompt_token_ids or [],
+                    generation_token_ids=completion_token_ids or [],
+                    generation_log_probs=logprobs or [],
+                )
+            else:
+                message = NeMoGymResponseOutputMessage(
+                    id=f"cht_{uuid4().hex[:12]}",
+                    content=content,
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
             output_items.append(message.model_dump())
 
             tool_calls = step.get("tool_calls", [])
@@ -269,105 +299,11 @@ class HarborAgentUtils:
     ) -> List[Dict[str, Any]]:
         """Convert Harbor trial output to NeMo Gym output items.
 
-        Behavior:
-        1. If trajectory is available, always include full rich output
-           (assistant messages + function_call + function_call_output).
-        2. If rollout_details are available, overlay token IDs/logprobs onto
-           assistant message items in order.
-        3. If only rollout_details exist, emit assistant messages from those.
-        4. Otherwise, return an empty list.
+        All output is derived from the ATIF trajectory.  Token IDs and
+        logprobs are read from each step's ``metrics`` (populated by
+        ``NemoGymLLM``).  Returns an empty list when no trajectory is
+        available.
         """
-        output_items: List[Dict[str, Any]] = []
-
-        agent_result = trial_result.get("agent_result")
-        assistant_turn_texts = HarborAgentUtils.extract_assistant_texts_from_trajectory(
-            trajectory
-        )
-        rollout_details = (
-            agent_result.get("rollout_details")
-            if agent_result and isinstance(agent_result, dict)
-            else None
-        )
-
-        # Build a flat list of rollout turns to overlay in order.
-        # Each item corresponds to one assistant response turn.
-        rollout_turns: List[Dict[str, Any]] = []
-        if rollout_details:
-            for rollout in rollout_details:
-                prompt_token_ids_list = rollout.get("prompt_token_ids") or []
-                completion_token_ids_list = rollout.get("completion_token_ids") or []
-                logprobs_list = rollout.get("logprobs") or []
-
-                n_turns = max(
-                    len(prompt_token_ids_list),
-                    len(completion_token_ids_list),
-                    len(logprobs_list),
-                )
-                for turn_idx in range(n_turns):
-                    rollout_turns.append(
-                        {
-                            "prompt_token_ids": (
-                                prompt_token_ids_list[turn_idx]
-                                if turn_idx < len(prompt_token_ids_list)
-                                else []
-                            ),
-                            "generation_token_ids": (
-                                completion_token_ids_list[turn_idx]
-                                if turn_idx < len(completion_token_ids_list)
-                                else []
-                            ),
-                            "generation_log_probs": (
-                                logprobs_list[turn_idx]
-                                if turn_idx < len(logprobs_list)
-                                else []
-                            ),
-                        }
-                    )
-
-        # Case 1: trajectory available -> preserve full rich output by default.
-        # If rollout token details exist, overlay onto assistant message turns.
         if trajectory and trajectory.get("steps"):
-            output_items = HarborAgentUtils.trajectory_to_responses(trajectory)
-            if rollout_turns:
-                assistant_idx = 0
-                for item in output_items:
-                    if item.get("type") == "message" and item.get("role") == "assistant":
-                        if assistant_idx >= len(rollout_turns):
-                            break
-                        turn = rollout_turns[assistant_idx]
-                        item["prompt_token_ids"] = turn["prompt_token_ids"]
-                        item["generation_token_ids"] = turn["generation_token_ids"]
-                        item["generation_log_probs"] = turn["generation_log_probs"]
-                        assistant_idx += 1
-            return output_items
-
-        # Case 2: rollout_details available without trajectory.
-        if rollout_turns:
-            for turn_idx, turn in enumerate(rollout_turns):
-                wrapped_message = NeMoGymResponseOutputMessageForTraining(
-                    id=f"cht_{uuid4().hex[:12]}",
-                    content=[
-                        NeMoGymResponseOutputText(
-                            annotations=[],
-                            text=(
-                                assistant_turn_texts[turn_idx]
-                                if turn_idx < len(assistant_turn_texts)
-                                else ""
-                            ),
-                            type="output_text",
-                            logprobs=None,
-                        ),
-                    ],
-                    role="assistant",
-                    status="completed",
-                    type="message",
-                    prompt_token_ids=turn["prompt_token_ids"],
-                    generation_token_ids=turn["generation_token_ids"],
-                    generation_log_probs=turn["generation_log_probs"],
-                )
-                output_items.append(wrapped_message.model_dump())
-
-            return output_items
-
-        # Case 3: no trajectory and no rollout_details -> no output items.
-        return output_items
+            return HarborAgentUtils.trajectory_to_responses(trajectory)
+        return []

@@ -14,6 +14,7 @@
 # limitations under the License.
 import json
 import tempfile
+from asyncio import Semaphore
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -65,6 +66,7 @@ DEFAULT_TRAJECTORY = {
             "source": "agent",
             "model_name": "hosted_vllm/test_model",
             "message": "Analysis: I will look at foo.py.\nPlan: Read the file and fix the bug.",
+            "reasoning_content": "Hidden reasoning step 1.",
             "tool_calls": [
                 {
                     "tool_call_id": "call_0_1",
@@ -73,7 +75,67 @@ DEFAULT_TRAJECTORY = {
                 }
             ],
             "observation": {"results": [{"content": "def foo():\n    return 1 + '2'\n"}]},
-            "metrics": {"prompt_tokens": 500, "completion_tokens": 100, "logprobs": [-0.01, -0.02, -0.03]},
+            "metrics": {
+                "prompt_tokens": 500,
+                "completion_tokens": 100,
+                "prompt_token_ids": [100, 101, 102],
+                "completion_token_ids": [200, 201, 202],
+                "logprobs": [-0.01, -0.02, -0.03],
+            },
+        },
+        {
+            "step_id": 3,
+            "source": "agent",
+            "model_name": "hosted_vllm/test_model",
+            "message": "Analysis: Found the bug. Fixing it now.\nPlan: Change '2' to 2.",
+            "reasoning_content": "Hidden reasoning step 2.",
+            "tool_calls": [
+                {
+                    "tool_call_id": "call_1_1",
+                    "function_name": "bash_command",
+                    "arguments": {"keystrokes": "sed -i 's/+ '2'/+ 2/' foo.py\n", "duration": 0.1},
+                }
+            ],
+            "observation": {"results": [{"content": ""}]},
+            "metrics": {
+                "prompt_tokens": 700,
+                "completion_tokens": 80,
+                "prompt_token_ids": [103, 104, 105],
+                "completion_token_ids": [203, 204, 205],
+                "logprobs": [-0.04, -0.05],
+            },
+        },
+    ],
+    "final_metrics": {"total_prompt_tokens": 1200, "total_completion_tokens": 180, "total_cached_tokens": 0},
+}
+
+
+# Trajectory without token-level details (no prompt_token_ids, completion_token_ids, logprobs).
+# Used to verify output messages are plain NeMoGymResponseOutputMessage (no training fields).
+TRAJECTORY_NO_TOKEN_DETAILS = {
+    "schema_version": "ATIF-v1.5",
+    "session_id": "test-session-456",
+    "agent": {"name": "terminus-2", "version": "2.0.0", "model_name": "hosted_vllm/test_model"},
+    "steps": [
+        {
+            "step_id": 1,
+            "source": "user",
+            "message": "You are an AI assistant. Solve this task:\nFix the bug in foo.py.",
+        },
+        {
+            "step_id": 2,
+            "source": "agent",
+            "model_name": "hosted_vllm/test_model",
+            "message": "Analysis: I will look at foo.py.\nPlan: Read the file and fix the bug.",
+            "tool_calls": [
+                {
+                    "tool_call_id": "call_0_1",
+                    "function_name": "bash_command",
+                    "arguments": {"keystrokes": "cat foo.py\n", "duration": 0.1},
+                }
+            ],
+            "observation": {"results": [{"content": "def foo():\n    return 1 + '2'\n"}]},
+            "metrics": {"prompt_tokens": 500, "completion_tokens": 100},
         },
         {
             "step_id": 3,
@@ -88,7 +150,7 @@ DEFAULT_TRAJECTORY = {
                 }
             ],
             "observation": {"results": [{"content": ""}]},
-            "metrics": {"prompt_tokens": 700, "completion_tokens": 80, "logprobs": [-0.04, -0.05]},
+            "metrics": {"prompt_tokens": 700, "completion_tokens": 80},
         },
     ],
     "final_metrics": {"total_prompt_tokens": 1200, "total_completion_tokens": 180, "total_cached_tokens": 0},
@@ -117,7 +179,6 @@ def create_test_config(**overrides) -> HarborAgentConfig:
         port=8080,
         entrypoint="",
         concurrency=1,
-        harbor_model_prefix="hosted_vllm",
         model_server={"type": "responses_api_models", "name": "test_model_server"},
         harbor_agent_name="terminus-2",
         harbor_local_dataset_path="/tmp/test_dataset",
@@ -178,8 +239,18 @@ def create_run_request(instance_id="test_task_123", **kwargs) -> HarborRunReques
 
 
 def _make_server(**config_overrides) -> HarborAgent:
-    """Create Harbor agent server with test defaults."""
-    return HarborAgent(config=create_test_config(**config_overrides), server_client=MagicMock())
+    """Create Harbor agent server with test defaults.
+
+    Uses ``model_construct`` to bypass Pydantic validation of the
+    ``server_client`` field (which expects a real ``ServerClient`` instance).
+    """
+    config = create_test_config(**config_overrides)
+    server = HarborAgent.model_construct(
+        config=config,
+        server_client=MagicMock(),
+        sem=Semaphore(config.concurrency),
+    )
+    return server
 
 
 # ===========================================================================
@@ -191,7 +262,7 @@ class TestApp:
     @patch("responses_api_agents.harbor_agent.app.get_global_config_dict")
     @patch("responses_api_agents.harbor_agent.app.runner_ray_remote")
     @patch("asyncio.to_thread")
-    async def test_run_with_rollout_details_overlays_training_fields(self, mock_to_thread, mock_ray, mock_gc):
+    async def test_run_with_trajectory_token_details(self, mock_to_thread, mock_ray, mock_gc):
         server = _make_server()
         setup_harbor_run_mock(mock_to_thread, mock_ray, mock_gc, trajectory=DEFAULT_TRAJECTORY)
 
@@ -202,12 +273,13 @@ class TestApp:
 
         msg0 = response.response.output[0]
         msg3 = response.response.output[3]
-        assert msg0.prompt_token_ids == [1, 2, 3]
-        assert msg0.generation_token_ids == [10, 11, 12]
-        assert msg0.generation_log_probs == [-0.1, -0.2, -0.3]
-        assert msg3.prompt_token_ids == [4, 5, 6]
-        assert msg3.generation_token_ids == [13, 14, 15]
-        assert msg3.generation_log_probs == [-0.4, -0.5, -0.6]
+        # Token details come from trajectory step metrics
+        assert msg0.prompt_token_ids == [100, 101, 102]
+        assert msg0.generation_token_ids == [200, 201, 202]
+        assert msg0.generation_log_probs == [-0.01, -0.02, -0.03]
+        assert msg3.prompt_token_ids == [103, 104, 105]
+        assert msg3.generation_token_ids == [203, 204, 205]
+        assert msg3.generation_log_probs == [-0.04, -0.05]
 
         # Contract requested in this thread.
         assert response.response.parallel_tool_calls is False
@@ -218,13 +290,17 @@ class TestApp:
     @patch("responses_api_agents.harbor_agent.app.get_global_config_dict")
     @patch("responses_api_agents.harbor_agent.app.runner_ray_remote")
     @patch("asyncio.to_thread")
-    async def test_run_without_rollout_details_omits_training_fields(self, mock_to_thread, mock_ray, mock_gc):
+    async def test_run_without_token_details_omits_training_fields(self, mock_to_thread, mock_ray, mock_gc):
         server = _make_server()
         trial_result = {
             **DEFAULT_TRIAL_RESULT,
             "agent_result": {"n_input_tokens": 1200, "n_output_tokens": 180, "rollout_details": []},
         }
-        setup_harbor_run_mock(mock_to_thread, mock_ray, mock_gc, trial_result=trial_result, trajectory=DEFAULT_TRAJECTORY)
+        setup_harbor_run_mock(
+            mock_to_thread, mock_ray, mock_gc,
+            trial_result=trial_result,
+            trajectory=TRAJECTORY_NO_TOKEN_DETAILS,
+        )
 
         response = await server.run(create_run_request())
 
@@ -280,10 +356,6 @@ class TestApp:
                 jobs_dir=Path("/tmp/harbor_jobs"),
             )
 
-    def test_resolve_model_name_requires_prefix(self) -> None:
-        with pytest.raises(ValueError, match="harbor_model_prefix is required"):
-            _make_server(harbor_model_prefix=None)._resolve_model_name("test_model")
-
     def test_results_and_job_paths_sanitize_model_and_job_name(self) -> None:
         server = _make_server(harbor_dataset_name="terminal-bench", harbor_dataset_version="2.0")
         ts = datetime(2026, 2, 10, 12, 34, 56, tzinfo=timezone.utc)
@@ -331,25 +403,33 @@ class TestExtractInputFromTrajectory:
 
 
 class TestTrialResultToResponses:
-    def test_prefers_rollout_details(self) -> None:
+    def test_reads_training_fields_from_trajectory_metrics(self) -> None:
+        """Token IDs and logprobs come from trajectory step metrics."""
         items = HarborAgentUtils.trial_result_to_responses(DEFAULT_TRIAL_RESULT, DEFAULT_TRAJECTORY)
         assert len(items) == 6
-        assert items[0]["prompt_token_ids"] == [1, 2, 3]
-        assert items[3]["prompt_token_ids"] == [4, 5, 6]
+        assert items[0]["prompt_token_ids"] == [100, 101, 102]
+        assert items[0]["generation_token_ids"] == [200, 201, 202]
+        assert items[0]["generation_log_probs"] == [-0.01, -0.02, -0.03]
+        assert items[3]["prompt_token_ids"] == [103, 104, 105]
+        assert items[3]["generation_token_ids"] == [203, 204, 205]
+        assert items[3]["generation_log_probs"] == [-0.04, -0.05]
         assert "I will look at foo.py" in items[0]["content"][0]["text"]
+        assert "<think>Hidden reasoning step 1.</think>" in items[0]["content"][0]["text"]
+        assert "<think>Hidden reasoning step 2.</think>" in items[3]["content"][0]["text"]
 
-    def test_rollout_only_without_trajectory(self) -> None:
+    def test_returns_empty_without_trajectory(self) -> None:
+        """Without a trajectory, output is empty regardless of trial_result."""
         items = HarborAgentUtils.trial_result_to_responses(DEFAULT_TRIAL_RESULT, None)
-        assert len(items) == 2
-        assert items[0]["prompt_token_ids"] == [1, 2, 3]
-        assert items[1]["prompt_token_ids"] == [4, 5, 6]
-        assert items[0]["content"][0]["text"] == ""
+        assert items == []
 
-    def test_falls_back_to_trajectory(self) -> None:
-        result = {**DEFAULT_TRIAL_RESULT, "agent_result": {"rollout_details": [], "n_input_tokens": 100, "n_output_tokens": 50}}
-        items = HarborAgentUtils.trial_result_to_responses(result, DEFAULT_TRAJECTORY)
+    def test_omits_training_fields_without_token_details(self) -> None:
+        """When trajectory metrics lack token IDs/logprobs, no training fields appear."""
+        items = HarborAgentUtils.trial_result_to_responses(DEFAULT_TRIAL_RESULT, TRAJECTORY_NO_TOKEN_DETAILS)
         assert len(items) == 6
+        assert "prompt_token_ids" not in items[0]
+        assert "generation_token_ids" not in items[0]
         assert "generation_log_probs" not in items[0]
+        assert "I will look at foo.py" in items[0]["content"][0]["text"]
 
     def test_falls_back_to_empty_output(self) -> None:
         result = {**DEFAULT_TRIAL_RESULT, "agent_result": {"rollout_details": [], "n_input_tokens": 100, "n_output_tokens": 50}}
