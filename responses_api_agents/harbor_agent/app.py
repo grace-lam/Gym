@@ -92,10 +92,6 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     # --- Model routing ---
     # NeMo Gym model server reference used to resolve Harbor model base URL.
     model_server: ModelServerRef
-    # LiteLLM provider prefix prepended to the model name (e.g. "hosted_vllm",
-    # "openai", "anthropic"). Required for routing requests to the correct backend.
-    harbor_model_prefix: Optional[str] = None
-
 class HarborRunRequest(BaseRunRequest):
     model_config = ConfigDict(extra="allow")
     instance_id: str
@@ -182,7 +178,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
 
             policy_model_name = global_config_dict["policy_model_name"]
             base_url = self._resolve_model_base_url(global_config_dict)
-            model_name = self._resolve_model_name(policy_model_name)
             run_timestamp = datetime.now(timezone.utc)
             run_id = self._build_run_id(run_timestamp)
 
@@ -192,18 +187,18 @@ class HarborAgent(SimpleResponsesAPIAgent):
             jobs_dir = self._get_jobs_output_dir(policy_model_name, run_timestamp)
             job_name = self._build_job_name(run_id)
 
-            temperature = body.responses_create_params.temperature
-            top_p = body.responses_create_params.top_p
+            responses_create_params = body.responses_create_params.model_dump(
+                exclude_unset=True,
+                exclude_none=True,
+            )
 
-            # Build Harbor JobConfig, forwarding sampling params to the agent.
-            # temperature is supported by Terminus-2; top_p is not yet forwarded by Harbor agents.
             job_config_dict = self._build_job_config(
                 instance_id,
-                model_name,
+                policy_model_name,
                 base_url,
                 job_name=job_name,
                 jobs_dir=jobs_dir,
-                temperature=temperature,
+                responses_create_params=responses_create_params,
             )
 
             try:
@@ -250,8 +245,8 @@ class HarborAgent(SimpleResponsesAPIAgent):
 
             response = HarborAgentUtils.get_default_response_object()
             response["model"] = policy_model_name
-            response["temperature"] = temperature
-            response["top_p"] = top_p
+            response["temperature"] = responses_create_params.get("temperature")
+            response["top_p"] = responses_create_params.get("top_p")
             response["output"] = output_items
             if usage:
                 response["usage"] = usage
@@ -336,16 +331,6 @@ class HarborAgent(SimpleResponsesAPIAgent):
         )
         return f"http://{model_server_config['host']}:{model_server_config['port']}/v1"
 
-    def _resolve_model_name(self, policy_model_name: str) -> str:
-        """Build Harbor/LiteLLM model name from explicit user-provided prefix."""
-        model_prefix = self.config.harbor_model_prefix
-        if not model_prefix:
-            raise ValueError(
-                "harbor_model_prefix is required (e.g. hosted_vllm, openai, anthropic). "
-                "Please set it in harbor_agent config."
-            )
-        return f"{model_prefix}/{policy_model_name}"
-
     def _build_job_config(
         self,
         instance_id: str,
@@ -353,7 +338,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
         api_base: str,
         job_name: str,
         jobs_dir: Path,
-        temperature: Optional[float] = None,
+        responses_create_params: Optional[dict[str, Any]] = None,
     ) -> dict:
         """Build a Harbor JobConfig dict for a single task."""
         from harbor.models.job.config import (
@@ -369,11 +354,12 @@ class HarborAgent(SimpleResponsesAPIAgent):
             VerifierConfig,
         )
 
-        # Sampling params are forwarded to the agent constructor via kwargs.
-        # Terminus-2 accepts `temperature` directly; other agents may ignore it.
         agent_kwargs: dict[str, Any] = {"api_base": api_base}
-        if temperature is not None:
-            agent_kwargs["temperature"] = temperature
+        if responses_create_params:
+            agent_kwargs["responses_create_params"] = responses_create_params
+            # Terminus-2 accepts temperature as a top-level kwarg for trajectory metadata.
+            if "temperature" in responses_create_params:
+                agent_kwargs["temperature"] = responses_create_params["temperature"]
         if self.config.harbor_agent_kwargs:
             agent_kwargs.update(self.config.harbor_agent_kwargs)
 

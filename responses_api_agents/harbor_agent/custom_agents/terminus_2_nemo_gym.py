@@ -37,7 +37,7 @@ class Terminus2NemoGym(Terminus2):
         record_terminal_session: bool = True,
         llm: BaseLLM | None = None,
         interleaved_thinking: bool = False,
-        nemo_model_server_api_key: str = "placeholder",
+        responses_create_params: dict[str, Any] | None = None,
         nemo_model_server_timeout_sec: float = 120.0,
         *args: Any,
         **kwargs: Any,
@@ -53,11 +53,9 @@ class Terminus2NemoGym(Terminus2):
             llm = NemoGymLLM(
                 model_name=model_name,
                 api_base=api_base,
-                api_key=nemo_model_server_api_key,
-                temperature=temperature,
                 collect_rollout_details=collect_rollout_details,
-                reasoning_effort=reasoning_effort,
                 model_info=model_info,
+                responses_create_params=responses_create_params,
                 timeout_sec=nemo_model_server_timeout_sec,
             )
 

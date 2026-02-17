@@ -40,7 +40,6 @@ harbor_agent:
       model_server:                            # Required NeMo Gym model server reference
         type: responses_api_models
         name: policy_model
-      harbor_model_prefix: "hosted_vllm"       # e.g. hosted_vllm, openai, anthropic
 
       # Timeouts
       harbor_agent_timeout: null               # Agent timeout override in seconds (null = Harbor/task default)
