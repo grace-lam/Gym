@@ -12,7 +12,8 @@ harbor_agent:
       # Exactly one mode should be configured. Task selection still happens per request via instance_id.
       harbor_dataset_name: null                # Registry dataset name (e.g., "terminal-bench")
       harbor_dataset_version: null             # Registry dataset version (e.g., "2.0")
-      harbor_local_dataset_path: null          # Filesystem path to local Harbor task dataset
+      # Filesystem path to local Harbor task dataset
+      harbor_local_dataset_path: "responses_api_agents/harbor_agent/data/nemotron_terminal_synthetic_tasks/skill_based/mixed/scientific_computing"
 
       # Agent – which Harbor agent to use (set name or import_path)
       harbor_agent_name: null
@@ -44,7 +45,7 @@ harbor_agent:
       harbor_environment_import_path: "responses_api_agents.harbor_agent.custom_envs.singularity.singularity:SingularityEnvironment"
       harbor_environment_kwargs:
         # Shared host cache for converted .sif images (avoid repeated pulls/conversions across jobs).
-        singularity_image_cache_dir: /path/to/singularity_cache
+        singularity_image_cache_dir: "responses_api_agents/harbor_agent/singularity_cache"
         # Container cwd used by command execution and server startup.
         workdir: "/app"
 

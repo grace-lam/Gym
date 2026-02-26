@@ -3,11 +3,85 @@
 This agent integrates [Harbor](https://github.com/laude-institute/harbor) into NeMo Gym.
 It runs Harbor agents (e.g., `terminus-2`) in Harbor-managed environments and returns NeMo Gym-compatible outputs.
 
+## Table of Contents
+
+- [Overview](#overview)
+  - [Custom agents](#custom-agents)
+  - [Custom environments](#custom-environments)
+- [Quick Start](#quick-start)
+- [NeMo RL Training](#nemo-rl-training)
+  - [Required patches to Gym](#required-patches-to-gym)
+  - [Recommended settings](#recommended-settings)
+  - [Finding failed rollouts](#finding-failed-rollouts)
+  - [Known failure cases during RL training](#known-failure-cases-during-rl-training)
+  - [On-policy corrections for multi-turn training](#on-policy-corrections-for-multi-turn-training)
+
+## Overview
+
+### Custom agents
+
+Harbor ships several agents, but for NeMo Gym RL we had to adapt the integration
+layer so agent outputs, trajectories, and token metadata are compatible with
+NeMo Gym/NeMo RL expectations (especially multi-turn token accounting and rollout
+details). In this repo, use the Terminus integration as the reference pattern for
+those adaptations.
+
+If you want to plug in a different Harbor agent, follow the Terminus wrapper flow
+as an example: keep Harbor's core agent behavior, then add a thin compatibility
+layer that normalizes message/output schema and preserves the metadata required by
+training.
+
+### Custom environments
+
+The default Harbor environments are not sufficient for HPC training, so this repo 
+includes a custom Singularity environment implementation.
+It is designed around task-local setup, staged task files, and predictable runtime
+paths used by Harbor jobs.
+For Singularity installation, image preparation (`docker_image` as `.sif` path vs
+registry reference), and optional registry auth, see [Quick Start: 2) Set up dependencies and task images](#2-set-up-dependencies-and-task-images).
+
+Any additional task files needed by the environment should be placed under
+`environment/files/`. This directory is bind-mounted into the container staging
+area and copied into the runtime filesystem during bootstrap, so scripts/assets are
+available before agent execution.
+
+For task setup, this environment supports an optional `environment/files/setup.sh`
+script. When present, it is run during environment initialization and is the right
+place for per-task dependency/setup steps.
+
+Common `harbor_environment_kwargs` for this environment:
+- `singularity_image_cache_dir`: cache directory for converted `.sif` images.
+- `singularity_force_pull`: force re-pull/re-convert the image instead of using cache.
+- `singularity_no_mount`: override/suppress selected Singularity default mounts.
+- `workdir`: override container working directory.
+
+Singularity does not enforce cgroups-based memory limits on most HPC clusters (no
+systemd init). The environment runs a userspace memory watchdog that monitors PSS
+and kills the container at 95% of the task's configured `memory_mb`.
+
 ## Quick Start
 
-### 1) Prerequisites
+This example uses the [`nvidia/Nemotron-Terminal-Synthetic-Tasks`](https://huggingface.co/datasets/nvidia/Nemotron-Terminal-Synthetic-Tasks) dataset and shows
+how to run a small reproducible slice through Harbor Agent + NeMo Gym before scaling
+to full training.
 
-- Install Apptainer/Singularity (required when running Harbor tasks on HPC clusters with the Singularity environment).
+### 1) Download the dataset
+
+```bash
+hf download \
+  nvidia/Nemotron-Terminal-Synthetic-Tasks \
+  --repo-type dataset \
+  --local-dir responses_api_agents/harbor_agent/data/nemotron_terminal_synthetic_tasks
+
+# From the repo root, unpack only one subset tarball (example: scientific_computing).
+tar -xzf responses_api_agents/harbor_agent/data/nemotron_terminal_synthetic_tasks/skill_based/mixed/scientific_computing.tar.gz -C responses_api_agents/harbor_agent/data/nemotron_terminal_synthetic_tasks/skill_based/mixed
+```
+
+### 2) Set up dependencies and task images
+
+- Install `git` (required because `requirements.txt` installs Harbor from a Git URL)
+  and Apptainer/Singularity (required when running Harbor tasks on HPC clusters
+  with the Singularity environment).
 
 ```bash
 apt-get update && apt-get install -y git wget
@@ -25,20 +99,43 @@ apptainer --version
     For examples of downloading and converting to `.sif`, see:
     https://github.com/NVIDIA/NeMo-Skills/blob/main/nemo_skills/dataset/swe-bench/dump_images.py.
 
-- (Optional) Set private registry credentials for Singularity pulls.
-  This is only needed when `docker_image` is a registry reference and the
-  environment must pull/convert it to `.sif` (for example:
-  `docker_image: private-registry/my-image:tag`).
+For this example workflow, we use the Docker reference mode and build/push
+images from task Dockerfiles.
+
+- If you push task images to a private registry, log in first on the Docker
+  build machine:
 
 ```bash
-export APPTAINER_DOCKER_USERNAME=<registry-username>
-export APPTAINER_DOCKER_PASSWORD=<registry-password-or-token>
+docker login <registry-host>
 ```
 
-### 2) Configure the vLLM model server
+- If Docker is not available on the Gym machine, use this split workflow:
+  1) On a Docker-capable machine, build+push images and write a manifest.
+  2) On the Gym machine, rewrite task `docker_image` fields from that manifest.
 
-If using the harbor agent for RL training, the companion vLLM model server config must enable token ID information and disable thinking history truncation.
-Use `configs/vllm_model_for_training.yaml`:
+```bash
+# 1) Build machine (Docker available)
+python responses_api_agents/harbor_agent/custom_envs/singularity/scripts/build_and_push_images.py \
+  --input responses_api_agents/harbor_agent/data/nemotron_terminal_synthetic_tasks/skill_based/mixed \
+  --shared-image-subfolder scientific_computing \
+  --registry <registry-host>/<namespace>/<repo> \
+  --manifest-out responses_api_agents/harbor_agent/data/manifests/scientific_computing_manifest.json
+
+# 2) Gym machine (no Docker required)
+python responses_api_agents/harbor_agent/custom_envs/singularity/scripts/rewrite_task_tomls.py \
+  --manifest-in responses_api_agents/harbor_agent/data/manifests/scientific_computing_manifest.json
+```
+
+### 3) Configure the vLLM model server
+
+If using the harbor agent for RL training, the companion vLLM model server config
+must enable token ID information and disable thinking history truncation. Use
+`configs/vllm_model_for_training.yaml`.
+
+If you are only collecting rollouts for inspection/debugging (not RL training),
+you can use `configs/vllm_model.yaml` instead.
+
+Training config example:
 
 ```yaml
 policy_model:
@@ -55,12 +152,23 @@ policy_model:
       uses_reasoning_parser: true
 ```
 
-### 3) Configure Harbor agent
+### 4) Configure Harbor agent
 
-Modify `configs/harbor_agent.yaml`. The default config uses the custom `Terminus2NemoGym`
-agent and `SingularityEnvironment` with the kwargs needed for RL training.
+The provided config `configs/harbor_agent.yaml` is already set up for this example (custom
+`Terminus2NemoGym` + `SingularityEnvironment` with training-oriented kwargs),
+but you can modify any fields as needed for your environment.
 
 ### 5) Start NeMo Gym servers
+
+If your task `docker_image` values are private registry references, export
+registry credentials before starting the servers:
+
+```bash
+export APPTAINER_DOCKER_USERNAME=<registry-username>
+export APPTAINER_DOCKER_PASSWORD=<registry-password-or-token>
+```
+
+Then start NeMo Gym:
 
 ```bash
 config_paths="responses_api_agents/harbor_agent/configs/harbor_agent.yaml,\
@@ -88,9 +196,11 @@ ng_collect_rollouts +agent_name=harbor_agent \
 ng_viewer +jsonl_fpath=responses_api_agents/harbor_agent/data/example_output.jsonl
 ```
 
-## Required patches to Gym
+## NeMo RL Training
 
-### Pass `chat_template_kwargs` to the tokenize endpoint
+### Required patches to Gym
+
+Pass `chat_template_kwargs` to the tokenize endpoint.
 
 **`Gym/responses_api_models/vllm_model/app.py`** — the `/tokenize` endpoint must
 receive `chat_template_kwargs` (e.g., `truncate_history_thinking: false`) to match
@@ -113,49 +223,6 @@ for key in ("model", "messages", "tools", "chat_template_kwargs"):
     if key in body_dict:
         tokenize_body_dict[key] = body_dict[key]
 ```
-
-## Custom agents
-
-Harbor ships several agents, but for NeMo Gym RL we had to adapt the integration
-layer so agent outputs, trajectories, and token metadata are compatible with
-NeMo Gym/NeMo RL expectations (especially multi-turn token accounting and rollout
-details). In this repo, use the Terminus integration as the reference pattern for
-those adaptations.
-
-If you want to plug in a different Harbor agent, follow the Terminus wrapper flow
-as an example: keep Harbor's core agent behavior, then add a thin compatibility
-layer that normalizes message/output schema and preserves the metadata required by
-training.
-
-## Custom environments
-
-The default Harbor environments are not sufficient for HPC training, so this repo 
-includes a custom Singularity environment implementation.
-It is designed around task-local setup, staged task files, and predictable runtime
-paths used by Harbor jobs.
-For Singularity installation, image preparation (`docker_image` as `.sif` path vs
-registry reference), and optional registry auth, see `1) Prerequisites` above.
-
-Any additional task files needed by the environment should be placed under
-`environment/files/`. This directory is bind-mounted into the container staging
-area and copied into the runtime filesystem during bootstrap, so scripts/assets are
-available before agent execution.
-
-For task setup, this environment supports an optional `environment/files/setup.sh`
-script. When present, it is run during environment initialization and is the right
-place for per-task dependency/setup steps.
-
-Common `harbor_environment_kwargs` for this environment:
-- `singularity_image_cache_dir`: cache directory for converted `.sif` images.
-- `singularity_force_pull`: force re-pull/re-convert the image instead of using cache.
-- `singularity_no_mount`: override/suppress selected Singularity default mounts.
-- `workdir`: override container working directory.
-
-Singularity does not enforce cgroups-based memory limits on most HPC clusters (no
-systemd init). The environment runs a userspace memory watchdog that monitors PSS
-and kills the container at 95% of the task's configured `memory_mb`.
-
-## NeMo RL Training
 
 ### Recommended settings
 
