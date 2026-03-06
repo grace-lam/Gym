@@ -274,42 +274,35 @@ class SingularityEnvironment(BaseEnvironment):
         bootstrap_script = self._staging_dir / "bootstrap.sh"
         bootstrap_script.write_text(
             "#!/bin/bash\n"
-            "# Harbor server bootstrap - run task setup.sh then start server.\n"
+            "# Harbor server bootstrap - minimal plumbing then start server.\n"
             "# First arg is WORKDIR (container cwd), rest are server args.\n"
-            'WORKDIR="${1:-/app}"; shift\n'
+            'export WORKDIR="${1:-/app}"; shift\n'
+            'export HARBOR_STAGING="/staging/env_files"\n'
             "\n"
-            "# Refresh apt cache so apt-get install (e.g. in setup.sh or for tmux) can find packages\n"
-            "if command -v apt-get >/dev/null 2>&1; then\n"
-            "  apt-get update -qq 2>/dev/null || true\n"
-            "fi\n"
-            "\n"
-            "# Workdir/venv/conda for Terminus-2 tmux login shells: set in task environment/files/setup.sh\n"
-            "# (e.g. append to ~/.bash_profile so bash --login sees correct PATH and activates venv/conda).\n"
-            "\n"
-            "if [ -d /staging/env_files ]; then\n"
-            "    mkdir -p /app\n"
-            "    cp -r /staging/env_files/. /app/ 2>/dev/null || true\n"
-            "    if [ -f /app/setup.sh ]; then\n"
-            '        echo "[harbor] Running task setup.sh..." >&2\n'
-            "        bash /app/setup.sh\n"
-            "    fi\n"
-            "fi\n"
-            "\n"
-            "# Terminus-2: tmux socket dir; /tmp may be read-only or unwritable in Singularity\n"
-            'export TMUX_TMPDIR="${TMUX_TMPDIR:-/app/.tmux-sockets}"\n'
+            "# Writable tmux socket dir (/tmp may be read-only under Singularity overlay)\n"
+            'mkdir -p "$WORKDIR"\n'
+            'export TMUX_TMPDIR="${WORKDIR}/.tmux-sockets"\n'
             'mkdir -p "$TMUX_TMPDIR"\n'
             "\n"
+            "# Run task-specific setup from staging (files are NOT auto-copied to /app;\n"
+            "# setup.sh should copy what it needs via: cp $HARBOR_STAGING/file /app/)\n"
+            'if [ -f "$HARBOR_STAGING/setup.sh" ]; then\n'
+            '    echo "[harbor] Running task setup.sh..." >&2\n'
+            '    bash "$HARBOR_STAGING/setup.sh"\n'
+            "fi\n"
+            "\n"
+            "# Find a Python with uvicorn available\n"
             'PYTHON_EXEC=""\n'
-            'for cand in "$(which python3 2>/dev/null | head -1)" "${WORKDIR}/.venv/bin/python3" "./.venv/bin/python3" "/usr/bin/python3" "/opt/conda/bin/python3" "/opt/miniconda3/bin/python3"; do\n'
+            'for cand in "$(command -v python3 2>/dev/null)" "${WORKDIR}/.venv/bin/python3" "/usr/bin/python3" "/opt/conda/bin/python3" "/opt/miniconda3/bin/python3"; do\n'
             '  if [ -n "$cand" ] && [ -x "$cand" ] && "$cand" -c "import uvicorn" 2>/dev/null; then\n'
             '    PYTHON_EXEC="$cand"; break\n'
             "  fi\n"
             "done\n"
             'if [ -z "$PYTHON_EXEC" ]; then\n'
-            '  echo "[harbor] Error: uvicorn not available. Add install to task environment/files/setup.sh" >&2\n'
+            '  echo "[harbor] Error: no python3 with uvicorn found. Install in Dockerfile or setup.sh" >&2\n'
             "  exit 1\n"
             "fi\n"
-            "# Resolve to absolute path; exec the real path (not a symlink) so Python finds venv site-packages\n"
+            "# Resolve to absolute path so Python finds venv site-packages\n"
             'if [ "${PYTHON_EXEC#/}" = "$PYTHON_EXEC" ]; then\n'
             '  PYTHON_EXEC="$(cd "$(dirname "$PYTHON_EXEC")" && pwd)/$(basename "$PYTHON_EXEC")"\n'
             "fi\n"
@@ -359,7 +352,7 @@ class SingularityEnvironment(BaseEnvironment):
             bootstrap_cmd = [
                 "bash",
                 "-c",
-                'mkdir -p /app && exec /staging/bootstrap.sh "$@"',
+                'exec /staging/bootstrap.sh "$@"',
                 "bash",
                 self._workdir,
                 "/staging/_hbexec.py",

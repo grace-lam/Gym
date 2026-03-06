@@ -255,6 +255,13 @@ class HarborAgent(SimpleResponsesAPIAgent):
                     with open(trajectory_path, "r") as f:
                         trajectory = json.load(f)
 
+                # Read agent error flags written by the agent
+                agent_error_flags = {}
+                agent_error_flags_path = trial_dir / "agent" / "agent_error_flags.json"
+                if agent_error_flags_path.exists():
+                    with open(agent_error_flags_path, "r") as f:
+                        agent_error_flags = json.load(f)
+
                 # Extract reward from verifier result
                 verifier_result = trial_result.get("verifier_result")
                 reward = HarborAgentUtils.extract_reward(verifier_result)
@@ -273,6 +280,7 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 print(f"Error running Harbor job: {e}")
                 trial_result = None
                 trajectory = None
+                agent_error_flags = {}
                 output_items = []
                 input_messages = []
                 usage = None
@@ -297,6 +305,11 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 response=response,
                 instance_id=instance_id,
                 metadata=trial_result if trial_result else {},
+                context_length_exceeded_error=int(agent_error_flags.get("context_length_exceeded", False)),
+                memory_limit_exceeded_error=int(agent_error_flags.get("memory_limit_exceeded", False)),
+                agent_timeout_error=int(
+                    ((trial_result or {}).get("exception_info") or {}).get("exception_type") == "AgentTimeoutError"
+                ),
             )
 
             # Save result to disk (folder = run_id, file = task name)

@@ -73,6 +73,9 @@ class NemoGymLLM(BaseLLM):
         self._last_completion_token_ids: list[int] | None = None
         self._last_logprobs: list[float] | None = None
 
+        # Set when the model hits the context length limit.
+        self.context_length_exceeded = False
+
         # Pre-compute extra chat params from responses_create_params once,
         # since they don't change between calls.
         self._extra_chat_params = self._build_extra_chat_params(responses_create_params or {})
@@ -124,6 +127,7 @@ class NemoGymLLM(BaseLLM):
         # When vLLM returns 400 "maximum context length", the proxy catches it
         # and returns a fake 200 with id="chtcmpl-123" and content=None.
         if response_dict.get("id") == "chtcmpl-123":
+            self.context_length_exceeded = True
             raise ContextLengthExceededError(
                 f"Model {self._model_name} context length exceeded (detected fake response id='chtcmpl-123')"
             )
@@ -249,6 +253,7 @@ class NemoGymLLM(BaseLLM):
         if response.status_code >= 400:
             error_text = response.text.lower()
             if any(phrase in error_text for phrase in _CONTEXT_LENGTH_ERROR_PHRASES):
+                self.context_length_exceeded = True
                 raise ContextLengthExceededError(f"Model {self._model_name} context length exceeded: {response.text}")
             response.raise_for_status()
 

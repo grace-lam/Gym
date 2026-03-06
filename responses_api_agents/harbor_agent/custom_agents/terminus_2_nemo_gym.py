@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 from pathlib import Path
 from typing import Any, Literal
 
@@ -21,6 +22,7 @@ from harbor.llms.base import BaseLLM
 from harbor.models.agent.context import AgentContext
 
 from responses_api_agents.harbor_agent.custom_agents.llms.nemo_gym_llm import NemoGymLLM
+from responses_api_agents.harbor_agent.custom_envs.singularity.singularity import MemoryLimitExceededError
 
 
 class Terminus2NemoGym(Terminus2):
@@ -107,7 +109,26 @@ class Terminus2NemoGym(Terminus2):
         turns (reward will be 0 for incomplete work) instead of crashing the
         entire rollout batch.
         """
+        self._memory_limit_exceeded = False
         try:
             await super().run(instruction, environment, context)
+        except MemoryLimitExceededError as e:
+            self._memory_limit_exceeded = True
+            self.logger.info(f"Agent error: {type(e).__name__}: {e}. Returning history from completed turns.")
         except Exception as e:
             self.logger.info(f"Agent error: {type(e).__name__}: {e}. Returning history from completed turns.")
+        finally:
+            self._write_agent_error_flags()
+
+    def _write_agent_error_flags(self) -> None:
+        """Write agent error flags to disk for app.py to pick up."""
+        try:
+            flags: dict[str, bool] = {
+                "memory_limit_exceeded": self._memory_limit_exceeded,
+            }
+            llm = getattr(self, "_llm", None)
+            if llm and isinstance(llm, NemoGymLLM):
+                flags["context_length_exceeded"] = llm.context_length_exceeded
+            (self.logs_dir / "agent_error_flags.json").write_text(json.dumps(flags))
+        except Exception:
+            pass  # Don't let flag-writing failures break the agent

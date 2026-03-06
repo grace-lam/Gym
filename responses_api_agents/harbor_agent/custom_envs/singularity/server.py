@@ -86,19 +86,20 @@ def _warm_tmux_server():
 
     Never crashes - just logs and continues.
     """
-    tmux_path = shutil.which("tmux") or "/usr/bin/tmux"
+    tmux_path = shutil.which("tmux")
+    if not tmux_path:
+        logger.debug("tmux not found on PATH, skipping pre-start")
+        return
     try:
         result = subprocess.run(
             [tmux_path, "start-server"],
             capture_output=True,
             text=True,
             timeout=5,
-            env={**os.environ, "PATH": "/usr/bin:/usr/local/bin:" + os.environ.get("PATH", "/bin")},
         )
         if result.returncode == 0:
             logger.debug("Pre-started tmux server")
         else:
-            # Log at warning level so it appears in server.log
             logger.warning(f"tmux start-server returned {result.returncode}: {result.stderr}")
     except Exception as e:
         logger.warning(f"Could not pre-start tmux server: {e}")
@@ -112,11 +113,12 @@ async def lifespan(app: FastAPI):
     yield
     logger.debug("Singularity FastAPI server shutting down...")
     try:
-        _tmux = shutil.which("tmux") or "/usr/bin/tmux"
-        subprocess.run([_tmux, "kill-server"], capture_output=True, timeout=5)
-        logger.debug("Stopped tmux server")
+        _tmux = shutil.which("tmux")
+        if _tmux:
+            subprocess.run([_tmux, "kill-server"], capture_output=True, timeout=5)
+            logger.debug("Stopped tmux server")
     except Exception as e:
-        logger.warning(f"Could not stop tmux server: {e}")
+        logger.debug(f"Could not stop tmux server: {e}")
 
 
 # =============================================================================
@@ -174,8 +176,15 @@ def exec_command(req: CommandRequest):
 
     # Set up environment
     env = os.environ.copy()
-    # Ensure PATH includes standard locations so apt-installed tools (e.g. tmux) are found
-    env["PATH"] = "/usr/bin:/usr/local/bin:" + env.get("PATH", "/bin")
+    # Ensure PATH includes standard locations so apt-installed tools (e.g. tmux) are found.
+    # Append (don't prepend) to respect the image's PATH ordering — e.g. python:3.13-slim
+    # has /usr/local/bin before /usr/bin so pip-installed packages resolve correctly.
+    path = env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    path_dirs = path.split(":")
+    for d in ("/usr/local/bin", "/usr/bin"):
+        if d not in path_dirs:
+            path = path + ":" + d
+    env["PATH"] = path
     if req.env:
         env.update(req.env)
 
