@@ -96,6 +96,12 @@ class HarborAgentConfig(BaseResponsesAPIAgentConfig):
     # Cap verifier timeout (seconds). Uses the task's own verifier timeout but
     # clamps it to this maximum.
     harbor_verifier_max_timeout: Optional[int] = None
+    # Override environment build timeout (seconds). Replaces the task's own
+    # build_timeout_sec entirely.
+    harbor_environment_override_build_timeout: Optional[int] = None
+    # Cap environment build timeout (seconds). Uses the task's own
+    # build_timeout_sec but clamps it to this maximum.
+    harbor_environment_max_build_timeout: Optional[int] = None
     # Multiplier applied to all Harbor timeouts after override/cap. None = 1.0.
     harbor_timeout_multiplier: Optional[float] = None
 
@@ -115,6 +121,38 @@ class HarborRunRequest(BaseRunRequest):
 
 class HarborVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
+    # Error flags (0/1) from Harbor agent and trial result.
+    context_length_exceeded_error: int = 0
+    memory_limit_exceeded_error: int = 0
+    agent_timeout_error: int = 0
+    # Timing durations (seconds) extracted from Harbor result.json phase timestamps.
+    # These are top-level numeric fields so they flow through the per-agent metrics
+    # pipeline in rollouts.py and get logged to wandb automatically.
+    environment_setup_time: float = 0.0
+    agent_setup_time: float = 0.0
+    agent_execution_time: float = 0.0
+    verifier_time: float = 0.0
+
+
+def _phase_duration_seconds(trial_result: dict, phase_key: str) -> float:
+    """Compute duration in seconds for a Harbor result.json phase (e.g. 'environment_setup').
+
+    Each phase has 'started_at' and 'finished_at' ISO-8601 timestamps.
+    Returns 0.0 if the phase is missing or timestamps are unparseable.
+    """
+    phase = trial_result.get(phase_key)
+    if not phase or not isinstance(phase, dict):
+        return 0.0
+    started = phase.get("started_at")
+    finished = phase.get("finished_at")
+    if not started or not finished:
+        return 0.0
+    try:
+        dt_start = datetime.fromisoformat(started)
+        dt_end = datetime.fromisoformat(finished)
+        return max((dt_end - dt_start).total_seconds(), 0.0)
+    except (ValueError, TypeError):
+        return 0.0
 
 
 async def run_harbor_job(job_config_dict: dict) -> str:
@@ -133,6 +171,29 @@ async def run_harbor_job(job_config_dict: dict) -> str:
     from harbor.job import Job
     from harbor.models.job.config import JobConfig
 
+    # Extract build timeout overrides (not part of JobConfig, passed as extras).
+    override_build_timeout = job_config_dict.pop("_environment_override_build_timeout", None)
+    max_build_timeout = job_config_dict.pop("_environment_max_build_timeout", None)
+
+    # Monkey-patch Task to apply build timeout override/max after loading.
+    # Harbor's trial config doesn't support environment build timeout overrides,
+    # so we patch the Task class to clamp build_timeout_sec in-process.
+    if override_build_timeout is not None or max_build_timeout is not None:
+        from harbor.models.task.task import Task
+
+        _original_task_init = Task.__init__
+
+        def _patched_task_init(self, task_dir):
+            _original_task_init(self, task_dir)
+            current = self.config.environment.build_timeout_sec
+            if override_build_timeout is not None:
+                current = float(override_build_timeout)
+            if max_build_timeout is not None:
+                current = min(current, float(max_build_timeout))
+            self.config.environment.build_timeout_sec = current
+
+        Task.__init__ = _patched_task_init
+
     config = JobConfig(**job_config_dict)
     job = Job(config)
 
@@ -141,6 +202,11 @@ async def run_harbor_job(job_config_dict: dict) -> str:
         await job.run()
     except Exception as e:
         job_error = e
+    finally:
+        # Restore original Task.__init__ to avoid leaking state between
+        # sequential invocations on the same Ray worker.
+        if override_build_timeout is not None or max_build_timeout is not None:
+            Task.__init__ = _original_task_init  # type: ignore[method-assign]
 
     # Find the trial directory from the job output directory.  Harbor writes
     # result.json before propagating most exceptions, so we can usually
@@ -299,6 +365,13 @@ class HarborAgent(SimpleResponsesAPIAgent):
             if input_messages:
                 updated_params = body.responses_create_params.model_copy(update={"input": input_messages})
 
+            # Compute phase durations from Harbor result.json timestamps
+            _tr = trial_result or {}
+            env_setup_time = _phase_duration_seconds(_tr, "environment_setup")
+            agent_setup_time = _phase_duration_seconds(_tr, "agent_setup")
+            agent_execution_time = _phase_duration_seconds(_tr, "agent_execution")
+            verifier_time = _phase_duration_seconds(_tr, "verifier")
+
             verify_response = HarborVerifyResponse(
                 responses_create_params=updated_params,
                 reward=reward,
@@ -310,6 +383,10 @@ class HarborAgent(SimpleResponsesAPIAgent):
                 agent_timeout_error=int(
                     ((trial_result or {}).get("exception_info") or {}).get("exception_type") == "AgentTimeoutError"
                 ),
+                environment_setup_time=env_setup_time,
+                agent_setup_time=agent_setup_time,
+                agent_execution_time=agent_execution_time,
+                verifier_time=verifier_time,
             )
 
             # Save result to disk (folder = run_id, file = task name)
@@ -503,7 +580,19 @@ class HarborAgent(SimpleResponsesAPIAgent):
             datasets=[dataset_config],
         )
 
-        return job_config.model_dump(mode="json")
+        job_config_dict = job_config.model_dump(mode="json")
+
+        # Inject build timeout overrides as extras — these are not part of
+        # JobConfig's schema and are popped by run_harbor_job before
+        # constructing the JobConfig.
+        if self.config.harbor_environment_override_build_timeout is not None:
+            job_config_dict["_environment_override_build_timeout"] = (
+                self.config.harbor_environment_override_build_timeout
+            )
+        if self.config.harbor_environment_max_build_timeout is not None:
+            job_config_dict["_environment_max_build_timeout"] = self.config.harbor_environment_max_build_timeout
+
+        return job_config_dict
 
 
 if __name__ == "__main__":
